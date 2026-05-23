@@ -1,5 +1,2 @@
-# JH WEATHER PRO v2 — Web Edition
-# Instalar con: pip install -r requirements.txt
-
-flet>=0.24.0        # Framework UI — versión web-first con soporte asyncio nativo
-requests>=2.31.0    # Llamadas HTTP a OpenWeatherMap e ip-api
+flet>=0.21.0
+requests
