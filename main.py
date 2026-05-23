@@ -562,7 +562,7 @@ class WeatherPro:
 
         tip = ft.Container(
             content=ft.Text(self.txt["tip_click"], size=9, color=C["muted"], italic=True),
-            padding=ft.padding.only(left=20, top=5, bottom=5),
+            padding=10,
         )
 
         # page.scroll = AUTO → page.add() actúa como una lista vertical simple.
