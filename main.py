@@ -11,7 +11,7 @@ Cambios aplicados:
   5. Persistencia via page.client_storage (sin archivos físicos)
   6. Geolocalización nativa con ft.Geolocator (permiso del navegador) + búsqueda manual
   7. Botón "MI UBICACIÓN" eliminado (solo búsqueda manual y actualización)
-  8. Alertas con scroll horizontal para evitar cortes en móvil
+  8. Alertas con expansión vertical (sin scroll horizontal)
 """
 
 import asyncio
@@ -961,6 +961,10 @@ class WeatherPro:
             self.alert_banner.visible = False
         self.page.update()
 
+    # ──────────────────────────────────────────────────────────────────────
+    # ACTUALIZACIÓN DE ALERTAS (con expansión vertical, sin scroll)
+    # ──────────────────────────────────────────────────────────────────────
+
     def _update_alerts_display(self):
         self._analyze_alerts()
         if not self.active_alerts:
@@ -998,20 +1002,20 @@ class WeatherPro:
 
             details_text = "\n".join(f"• {d}" for d in alert.details) if alert.details else ""
 
-            # Scroll horizontal para descripción y detalles
-            description_row = ft.Row(
-                controls=[
-                    ft.Text(alert.description, size=11, color=tx_c, no_wrap=True),
-                ],
-                scroll=ft.ScrollMode.AUTO,
-                spacing=0,
+            # Descripción: se envuelve automáticamente (expansión vertical)
+            description_text = ft.Text(
+                alert.description,
+                size=11,
+                color=tx_c,
+                wrap=True,
             )
-            details_row = ft.Row(
-                controls=[
-                    ft.Text(details_text, size=10, color=tx_c, no_wrap=True),
-                ],
-                scroll=ft.ScrollMode.AUTO,
-                spacing=0,
+
+            # Detalles: también se expanden verticalmente
+            details_component = ft.Text(
+                details_text,
+                size=10,
+                color=tx_c,
+                wrap=True,
             ) if details_text else ft.Container()
 
             alert_controls.append(ft.Container(
@@ -1020,8 +1024,8 @@ class WeatherPro:
                         ft.Text(alert.icon, size=28),
                         ft.Text(alert.title, size=14, weight=ft.FontWeight.BOLD, color=tx_c),
                     ], spacing=10),
-                    description_row,
-                    details_row,
+                    description_text,
+                    details_component,
                 ], spacing=8),
                 bgcolor=bg_c, border_radius=10, padding=12,
                 margin=ft.margin.only(bottom=10),
@@ -1030,6 +1034,10 @@ class WeatherPro:
             controls=alert_controls, spacing=10,
         )
         self.page.update()
+
+    # ──────────────────────────────────────────────────────────────────────
+    # ACTUALIZACIÓN DE WIDGETS (idéntico)
+    # ──────────────────────────────────────────────────────────────────────
 
     def _update_current_weather(self):
         if not self.current_weather:
