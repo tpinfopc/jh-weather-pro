@@ -19,5 +19,4 @@ COPY . .
 
 EXPOSE 8000
 
-CMD ["python", "-m", "flet", "run", "--web", "main.py"]
-
+CMD ["python", "main.py"]
