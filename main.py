@@ -5,13 +5,13 @@ Migrado a entorno web con Flet 0.24+
 
 Cambios aplicados:
   1. ft.app con view=ft.AppView.WEB_BROWSER
-  2. API Key via os.getenv("OWM_API_KEY") — compatible con Netlify/Vercel env vars
+  2. API Key via os.getenv("OWM_API_KEY") — compatible con Render/Netlify/Vercel
   3. threading.Timer reemplazado por asyncio; geoloc y llamadas HTTP en async threads
   4. Responsividad con wrap=True / expand en filas dinámicas
   5. Persistencia via page.client_storage (sin archivos físicos)
-  6. Geolocalización nativa con ft.Geolocator (permiso del navegador) - evita IP del servidor
-  7. Búsqueda manual de ciudad (input + botón) y botón "Usar mi ubicación"
-  8. Fallback a búsqueda manual si la geolocalización falla o es denegada
+  6. Geolocalización nativa con ft.Geolocator (permiso del navegador) + búsqueda manual
+  7. Botón "MI UBICACIÓN" eliminado (solo búsqueda manual y actualización)
+  8. Alertas con scroll horizontal para evitar cortes en móvil
 """
 
 import asyncio
@@ -55,7 +55,7 @@ C = {
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURACIÓN API  — ⚠️ NUNCA hardcodear la key en producción
 # ─────────────────────────────────────────────────────────────────────────────
-API_KEY  = os.getenv("OWM_API_KEY", "5a8a0445802b0a19a3a6bc8b925f8536")          # Vacío → mostrará aviso en UI
+API_KEY  = os.getenv("OWM_API_KEY", "5a8a0445802b0a19a3a6bc8b925f8536")
 BASE_URL = "http://api.openweathermap.org/data/2.5"
 IP_API_URL = "http://ip-api.com/json/"
 
@@ -77,7 +77,6 @@ TEXTS = {
         "btn_refresh":          "  ACTUALIZAR  ",
         "btn_share":            "  COMPARTIR  ",
         "btn_search":           "  BUSCAR  ",
-        "btn_use_location":     "📍 MI UBICACIÓN",
         "search_placeholder":   "Ingresá una ciudad (ej: Buenos Aires)",
         "label_location":       "UBICACIÓN ACTUAL",
         "label_current":        "CLIMA ACTUAL",
@@ -143,7 +142,6 @@ TEXTS = {
         "btn_refresh":          "  REFRESH  ",
         "btn_share":            "  SHARE  ",
         "btn_search":           "  SEARCH  ",
-        "btn_use_location":     "📍 MY LOCATION",
         "search_placeholder":   "Enter a city (e.g., London)",
         "label_location":       "CURRENT LOCATION",
         "label_current":        "CURRENT WEATHER",
@@ -280,13 +278,6 @@ class WeatherAlert:
 class WeatherPro:
     """
     Aplicación web de clima con temática Cyberpunk/Dark.
-
-    Funcionalidades:
-      - Búsqueda manual de ciudad (input + botón)
-      - Geolocalización automática (si el navegador lo permite y el usuario acepta)
-      - Botón "Usar mi ubicación" para solicitar permisos explícitamente
-      - Internación en español/inglés (persistente)
-      - Pronóstico horario y diario, alertas meteorológicas
     """
 
     def __init__(self, page: ft.Page):
@@ -317,15 +308,15 @@ class WeatherPro:
         self.selected_day         = None
         self._clock_running       = True
 
-        # Textos (se setean después de cargar config)
+        # Textos
         self.txt = TEXTS[self.language]
 
-        # Controles UI compartidos entre builds
+        # Controles UI
         self.status_text  = ft.Text(self.txt["status_starting"], color=C["warn"], size=12, weight=ft.FontWeight.BOLD)
         self.clock_text   = ft.Text("", color=C["muted"], size=11)
         self.city_display = ft.Text("Detectando ubicación...", color=C["accent"], size=20, weight=ft.FontWeight.BOLD)
 
-        # Campo de búsqueda manual
+        # Búsqueda manual
         self.search_input = ft.TextField(
             hint_text=self.txt["search_placeholder"],
             width=250,
@@ -336,7 +327,6 @@ class WeatherPro:
             on_submit=self._on_search_submit,
         )
         self.search_button = self._create_button(self.txt["btn_search"], self._search_city, C["accent"], C["button_text"])
-        self.location_button = self._create_button(self.txt["btn_use_location"], self._force_location, C["green"], C["button_text"])
 
         self.unit_switch  = ft.Switch(value=True,  on_change=self.toggle_units,    active_color=C["accent"])
         self.lang_switch  = ft.Switch(value=False, on_change=self.toggle_language, active_color=C["accent2"])
@@ -385,14 +375,11 @@ class WeatherPro:
             ),
         )
 
-        # Verificar API key
         if not API_KEY:
             self.status_text.value = self.txt["status_no_apikey"]
             self.status_text.color = C["red"]
 
         self._build_ui()
-
-        # Lanzar reloj async y carga de config + geolocalización
         self.page.run_task(self._async_init)
 
     # ──────────────────────────────────────────────────────────────────────
@@ -400,37 +387,29 @@ class WeatherPro:
     # ──────────────────────────────────────────────────────────────────────
 
     async def _async_init(self):
-        """Carga config desde client_storage, luego lanza reloj y geoloc."""
         await self._load_config()
         self.txt = TEXTS[self.language]
         self.unit_switch.value = self.use_celsius
         self.lang_switch.value = (self.language == "en")
         self.search_input.hint_text = self.txt["search_placeholder"]
         self.search_button.text = self.txt["btn_search"]
-        self.location_button.text = self.txt["btn_use_location"]
         self.page.update()
 
-        # Reloj en tiempo real — corrutina sin threading.Timer
         self.page.run_task(self._clock_loop)
-
-        # Solicitar ubicación automáticamente al inicio (solo si el navegador lo permite)
         await self._request_browser_location()
 
     # ──────────────────────────────────────────────────────────────────────
-    # GEOLOCALIZACIÓN NATIVA DEL NAVEGADOR (ft.Geolocator)
+    # GEOLOCALIZACIÓN
     # ──────────────────────────────────────────────────────────────────────
 
     async def _request_browser_location(self):
-        """Pide permiso al navegador, obtiene lat/lon y actualiza el clima."""
         self.status_text.value = self.txt["status_detecting"]
         self.status_text.color = C["warn"]
         self.city_display.value = "Solicitando permisos de ubicación..."
         self.page.update()
 
-        # Verificar si la página es HTTPS (obligatorio para geolocalización)
         is_secure = self.page.web_launch_url.startswith("https") if self.page.web_launch_url else False
         if not is_secure:
-            print("⚠️ La aplicación no se sirve sobre HTTPS. La geolocalización puede fallar.")
             self.status_text.value = "● HTTPS requerido para ubicación precisa"
             self.status_text.color = C["red"]
             self.city_display.value = "Usá la búsqueda manual para obtener el clima"
@@ -441,21 +420,14 @@ class WeatherPro:
             pos = await self.geolocator.get_current_position()
             lat = pos.latitude
             lon = pos.longitude
-            print(f"📍 Ubicación obtenida: {lat}, {lon}")
             self.get_weather_by_coords(lat, lon)
         except Exception as e:
-            print(f"❌ Error en geolocalización nativa: {e}")
             self.status_text.value = self.txt["status_error_location"]
             self.status_text.color = C["warn"]
             self.city_display.value = "No se pudo obtener ubicación. Usá la búsqueda manual."
             self.page.update()
 
-    def _force_location(self, e):
-        """Botón para forzar la solicitud de ubicación."""
-        self.page.run_task(self._request_browser_location)
-
     def get_weather_by_coords(self, lat: float, lon: float):
-        """Pide el clima usando latitud y longitud directamente a OpenWeatherMap."""
         self.status_text.value = self.txt["status_loading"]
         self.status_text.color = C["warn"]
         self.page.update()
@@ -464,7 +436,6 @@ class WeatherPro:
     def _fetch_weather_by_coords(self, lat: float, lon: float):
         try:
             params = {"lat": lat, "lon": lon, "appid": API_KEY, "units": "metric", "lang": "es"}
-
             r = requests.get(f"{BASE_URL}/weather", params=params, timeout=10)
             if r.status_code == 401:
                 self.status_text.value = self.txt["status_error_apikey"]
@@ -480,12 +451,10 @@ class WeatherPro:
             self.city_display.value = city_name
             self.current_weather = weather_data
 
-            # Pronóstico con mismas coordenadas
             rf = requests.get(f"{BASE_URL}/forecast", params=params, timeout=10)
             rf.raise_for_status()
             self.forecast_data = rf.json()
 
-            # Datos horarios próximas 24 h
             self.hourly_forecast = []
             for item in self.forecast_data.get("list", [])[:8]:
                 dt = datetime.datetime.fromtimestamp(item["dt"])
@@ -518,28 +487,16 @@ class WeatherPro:
             self.status_text.value = self.txt["status_updated"]
             self.status_text.color = C["green"]
             self.page.update()
-
-        except requests.exceptions.RequestException as exc:
-            msg = str(exc)
-            if "401" in msg:
-                self.status_text.value = "● Error: API Key inválida"
-            elif "404" in msg:
-                self.status_text.value = "● Error: No se encontró la ubicación"
-            else:
-                self.status_text.value = f"● Error: {msg[:40]}"
-            self.status_text.color = C["red"]
-            self.page.update()
         except Exception as exc:
             self.status_text.value = f"● Error: {str(exc)[:40]}"
             self.status_text.color = C["red"]
             self.page.update()
 
     # ──────────────────────────────────────────────────────────────────────
-    # BÚSQUEDA MANUAL DE CIUDAD
+    # BÚSQUEDA MANUAL
     # ──────────────────────────────────────────────────────────────────────
 
     def _search_city(self, e):
-        """Busca la ciudad ingresada en el campo de texto."""
         city = self.search_input.value.strip()
         if not city:
             self.status_text.value = "● Ingresá el nombre de una ciudad"
@@ -549,11 +506,9 @@ class WeatherPro:
         self.get_weather_by_city(city)
 
     def _on_search_submit(self, e):
-        """Mismo que _search_city (al presionar Enter)."""
         self._search_city(e)
 
     def get_weather_by_city(self, city: str):
-        """Lanza la petición HTTP por nombre de ciudad."""
         self.status_text.value = self.txt["status_loading"]
         self.status_text.color = C["warn"]
         self.page.update()
@@ -562,7 +517,6 @@ class WeatherPro:
     def _fetch_weather_by_city(self, city: str):
         try:
             params = {"q": city, "appid": API_KEY, "units": "metric", "lang": "es"}
-
             r = requests.get(f"{BASE_URL}/weather", params=params, timeout=10)
             if r.status_code == 401:
                 self.status_text.value = self.txt["status_error_apikey"]
@@ -619,38 +573,25 @@ class WeatherPro:
             self.status_text.value = self.txt["status_updated"]
             self.status_text.color = C["green"]
             self.page.update()
-
-        except requests.exceptions.RequestException as exc:
-            msg = str(exc)
-            if "401" in msg:
-                self.status_text.value = "● Error: API Key inválida"
-            elif "404" in msg:
-                self.status_text.value = f"● Error: Ciudad '{city}' no encontrada"
-            else:
-                self.status_text.value = f"● Error: {msg[:40]}"
-            self.status_text.color = C["red"]
-            self.page.update()
         except Exception as exc:
             self.status_text.value = f"● Error: {str(exc)[:40]}"
             self.status_text.color = C["red"]
             self.page.update()
 
     # ──────────────────────────────────────────────────────────────────────
-    # PERSISTENCIA — page.client_storage
+    # PERSISTENCIA
     # ──────────────────────────────────────────────────────────────────────
 
     async def _load_config(self):
-        """Lee preferencias desde el localStorage del navegador."""
         try:
             celsius  = await self.page.client_storage.get_async("jh_weather.use_celsius")
             language = await self.page.client_storage.get_async("jh_weather.language")
             if celsius  is not None: self.use_celsius = bool(celsius)
             if language is not None: self.language    = str(language)
         except Exception:
-            pass  # Primera visita o storage no disponible
+            pass
 
     async def _save_config(self):
-        """Persiste preferencias en el localStorage del navegador."""
         try:
             await self.page.client_storage.set_async("jh_weather.use_celsius", self.use_celsius)
             await self.page.client_storage.set_async("jh_weather.language",    self.language)
@@ -658,24 +599,22 @@ class WeatherPro:
             pass
 
     # ──────────────────────────────────────────────────────────────────────
-    # RELOJ EN TIEMPO REAL — asyncio
+    # RELOJ
     # ──────────────────────────────────────────────────────────────────────
 
     async def _clock_loop(self):
-        """Actualiza el reloj cada segundo sin bloquear el hilo principal."""
         while self._clock_running:
             self.clock_text.value = datetime.datetime.now().strftime("%d/%m/%Y  %H:%M:%S")
             self.page.update()
             await asyncio.sleep(1)
 
     # ──────────────────────────────────────────────────────────────────────
-    # CONSTRUCCIÓN DE UI
+    # UI
     # ──────────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
         self.txt = TEXTS[self.language]
 
-        # ── Header ──────────────────────────────────────────────────────
         header = ft.Container(
             content=ft.Row(
                 controls=[
@@ -706,7 +645,6 @@ class WeatherPro:
             padding=ft.padding.symmetric(horizontal=20, vertical=10),
         )
 
-        # ── Barra de botones + búsqueda ─────────────────────────────────────
         button_bar = ft.Container(
             content=ft.Row(
                 controls=[
@@ -714,7 +652,6 @@ class WeatherPro:
                     self._create_button(self.txt["btn_share"],   self.share_weather, C["warn"],  C["button_text"]),
                     self.search_input,
                     self.search_button,
-                    self.location_button,
                 ],
                 spacing=10, wrap=True,
             ),
@@ -726,7 +663,6 @@ class WeatherPro:
             padding=ft.padding.symmetric(horizontal=20, vertical=5),
         )
 
-        # ── Filas responsivas ─────────────────────────────────────────────
         top_row = ft.Row(
             controls=[
                 ft.Container(content=self.current_weather_container, width=360),
@@ -814,7 +750,6 @@ class WeatherPro:
         )
 
     def _refresh_weather(self, e):
-        """Refresca el clima actual de la ciudad que se está mostrando."""
         if self.current_city:
             self.get_weather_by_city(self.current_city)
         else:
@@ -822,7 +757,7 @@ class WeatherPro:
             self.page.update()
 
     # ──────────────────────────────────────────────────────────────────────
-    # PROCESAMIENTO DE DATOS (idéntico al original)
+    # PROCESAMIENTO DE DATOS (completo)
     # ──────────────────────────────────────────────────────────────────────
 
     def _process_hourly_data_by_day(self):
@@ -939,10 +874,6 @@ class WeatherPro:
                 "weather_id":  max_wid,
                 "period":      period_w_rain,
             }
-
-    # ──────────────────────────────────────────────────────────────────────
-    # ALERTAS
-    # ──────────────────────────────────────────────────────────────────────
 
     def _analyze_alerts(self):
         self.active_alerts = []
@@ -1066,14 +997,31 @@ class WeatherPro:
                 bg_c, tx_c = C["alert_red"],    "#ffffff"
 
             details_text = "\n".join(f"• {d}" for d in alert.details) if alert.details else ""
+
+            # Scroll horizontal para descripción y detalles
+            description_row = ft.Row(
+                controls=[
+                    ft.Text(alert.description, size=11, color=tx_c, no_wrap=True),
+                ],
+                scroll=ft.ScrollMode.AUTO,
+                spacing=0,
+            )
+            details_row = ft.Row(
+                controls=[
+                    ft.Text(details_text, size=10, color=tx_c, no_wrap=True),
+                ],
+                scroll=ft.ScrollMode.AUTO,
+                spacing=0,
+            ) if details_text else ft.Container()
+
             alert_controls.append(ft.Container(
                 content=ft.Column(controls=[
                     ft.Row(controls=[
                         ft.Text(alert.icon, size=28),
                         ft.Text(alert.title, size=14, weight=ft.FontWeight.BOLD, color=tx_c),
                     ], spacing=10),
-                    ft.Text(alert.description, size=11, color=tx_c),
-                    ft.Text(details_text, size=10, color=tx_c) if details_text else ft.Container(),
+                    description_row,
+                    details_row,
                 ], spacing=8),
                 bgcolor=bg_c, border_radius=10, padding=12,
                 margin=ft.margin.only(bottom=10),
@@ -1082,10 +1030,6 @@ class WeatherPro:
             controls=alert_controls, spacing=10,
         )
         self.page.update()
-
-    # ──────────────────────────────────────────────────────────────────────
-    # ACTUALIZACIÓN DE WIDGETS (idéntico)
-    # ──────────────────────────────────────────────────────────────────────
 
     def _update_current_weather(self):
         if not self.current_weather:
@@ -1376,10 +1320,8 @@ class WeatherPro:
         self.txt      = TEXTS[self.language]
         self.page.run_task(self._save_config)
         self.status_text.value = self.txt["status_updated"]
-        # Actualizar textos de la interfaz (botones, placeholders)
         self.search_input.hint_text = self.txt["search_placeholder"]
         self.search_button.text = self.txt["btn_search"]
-        self.location_button.text = self.txt["btn_use_location"]
         if self.current_city:
             self.get_weather_by_city(self.current_city)
         self._rebuild_ui()
