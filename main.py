@@ -9,8 +9,8 @@ Cambios aplicados:
   3. threading.Timer reemplazado por asyncio; geoloc y llamadas HTTP en async threads
   4. Responsividad con wrap=True / expand en filas dinámicas
   5. Persistencia via page.client_storage (sin archivos físicos)
-
-Requiere: pip install flet requests
+  6. Geolocalización nativa con ft.Geolocator (permiso del navegador) - evita IP del servidor
+  7. Fallback a IP-API si el usuario deniega o no hay geolocalización
 """
 
 import asyncio
@@ -53,9 +53,6 @@ C = {
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURACIÓN API  — ⚠️ NUNCA hardcodear la key en producción
-# En Netlify/Vercel: Settings → Environment Variables → OWM_API_KEY
-# En local: crea un archivo .env con:  OWM_API_KEY=tu_key_aqui
-#           y ejecuta `export $(cat .env)` antes de `flet run --web main.py`
 # ─────────────────────────────────────────────────────────────────────────────
 API_KEY  = os.getenv("OWM_API_KEY", "5a8a0445802b0a19a3a6bc8b925f8536")          # Vacío → mostrará aviso en UI
 BASE_URL = "http://api.openweathermap.org/data/2.5"
@@ -280,11 +277,10 @@ class WeatherPro:
     Cambios clave respecto a la versión de escritorio:
       • _load_config / _save_config  → page.client_storage (async)
       • _update_clock               → asyncio.create_task (sin threading.Timer)
-      • detect_location / get_weather_by_city → threading.Thread daemon=True
-        (Flet web tolera threads daemon; asyncio.run_in_executor también funciona)
+      • detect_location / get_weather_by_coords → threading.Thread daemon=True
       • _reset_status_text          → asyncio.sleep en corrutina
       • top_row / middle_row        → wrap=True para responsividad móvil
-      • window_width / height       eliminados (no aplican en web)
+      • Geolocalización nativa con ft.Geolocator (permiso del navegador)
     """
 
     def __init__(self, page: ft.Page):
@@ -295,6 +291,10 @@ class WeatherPro:
         self.page.theme_mode         = ft.ThemeMode.DARK
         self.page.vertical_alignment = ft.MainAxisAlignment.START
         self.page.scroll             = ft.ScrollMode.AUTO
+
+        # Geolocator nativo (se agrega al overlay)
+        self.geolocator = ft.Geolocator()
+        self.page.overlay.append(self.geolocator)
 
         # Estado interno
         self.current_weather      = None
@@ -322,8 +322,6 @@ class WeatherPro:
         self.lang_switch  = ft.Switch(value=False, on_change=self.toggle_language, active_color=C["accent2"])
 
         # Contenedores dinámicos
-        # min_height no existe en Flet <=0.24; se simula con un spacer Container
-        # que los métodos _update_* reemplazan al llegar los datos reales.
         self.current_weather_container = ft.Container(
             content=ft.Column(
                 controls=[ft.Text("⏳ Detectando...", color=C["muted"], size=12)],
@@ -375,7 +373,7 @@ class WeatherPro:
         self._build_ui()
 
         # Lanzar reloj async y carga de config + geolocalización
-        page.run_task(self._async_init)
+        self.page.run_task(self._async_init)
 
     # ──────────────────────────────────────────────────────────────────────
     # INIT ASÍNCRONO (reemplaza __init__ diferido)
@@ -392,221 +390,126 @@ class WeatherPro:
         # Reloj en tiempo real — corrutina sin threading.Timer
         self.page.run_task(self._clock_loop)
 
-        # Geolocalización en thread daemon para no bloquear el event loop
-        if API_KEY:
-            threading.Thread(target=self._detect_location_thread, daemon=True).start()
+        # Solicitar ubicación real al navegador
+        await self._request_browser_location()
 
     # ──────────────────────────────────────────────────────────────────────
-    # PERSISTENCIA — page.client_storage  (reemplaza JSON en disco)
+    # GEOLOCALIZACIÓN NATIVA DEL NAVEGADOR (ft.Geolocator)
     # ──────────────────────────────────────────────────────────────────────
 
-    async def _load_config(self):
-        """Lee preferencias desde el localStorage del navegador."""
-        try:
-            celsius  = await self.page.client_storage.get_async("jh_weather.use_celsius")
-            language = await self.page.client_storage.get_async("jh_weather.language")
-            if celsius  is not None: self.use_celsius = bool(celsius)
-            if language is not None: self.language    = str(language)
-        except Exception:
-            pass  # Primera visita o storage no disponible
-
-    async def _save_config(self):
-        """Persiste preferencias en el localStorage del navegador."""
-        try:
-            await self.page.client_storage.set_async("jh_weather.use_celsius", self.use_celsius)
-            await self.page.client_storage.set_async("jh_weather.language",    self.language)
-        except Exception:
-            pass
-
-    # ──────────────────────────────────────────────────────────────────────
-    # RELOJ EN TIEMPO REAL — asyncio (reemplaza threading.Timer recursivo)
-    # ──────────────────────────────────────────────────────────────────────
-
-    async def _clock_loop(self):
-        """Actualiza el reloj cada segundo sin bloquear el hilo principal."""
-        while self._clock_running:
-            self.clock_text.value = datetime.datetime.now().strftime("%d/%m/%Y  %H:%M:%S")
-            self.page.update()
-            await asyncio.sleep(1)
-
-    # ──────────────────────────────────────────────────────────────────────
-    # CONSTRUCCIÓN DE UI
-    # ──────────────────────────────────────────────────────────────────────
-
-    def _build_ui(self):
-        self.txt = TEXTS[self.language]
-
-        # ── Header ──────────────────────────────────────────────────────
-        header = ft.Container(
-            content=ft.Row(
-                controls=[
-                    ft.Text(self.txt["title"], size=20, weight=ft.FontWeight.BOLD, color=C["accent"]),
-                    ft.Container(
-                        content=ft.Row(
-                            controls=[ft.Text("🔧", size=14, color=C["green"]), self.status_text],
-                            spacing=5,
-                        )
-                    ),
-                    ft.Row(
-                        controls=[
-                            ft.Text(self.txt["unit_celsius"], size=11, color=C["label"]),
-                            self.unit_switch,
-                            ft.Text(self.txt["lang_es"], size=10,
-                                    color=C["accent"] if self.language == "es" else C["muted"]),
-                            self.lang_switch,
-                            ft.Text(self.txt["lang_en"], size=10,
-                                    color=C["accent2"] if self.language == "en" else C["muted"]),
-                            self.clock_text,
-                        ],
-                        alignment=ft.MainAxisAlignment.END, spacing=5, wrap=True,
-                    ),
-                ],
-                alignment=ft.MainAxisAlignment.SPACE_BETWEEN, wrap=True,
-            ),
-            bgcolor="#070a0d",
-            padding=ft.padding.symmetric(horizontal=20, vertical=10),
-        )
-
-        # ── Barra de botones ─────────────────────────────────────────────
-        button_bar = ft.Container(
-            content=ft.Row(
-                controls=[
-                    self._create_button(self.txt["btn_refresh"], self.refresh_data, C["accent"], C["button_text"]),
-                    self._create_button(self.txt["btn_share"],   self.share_weather, C["warn"],  C["button_text"]),
-                ],
-                spacing=10, wrap=True,
-            ),
-            padding=ft.padding.symmetric(horizontal=20, vertical=8),
-        )
-
-        alert_banner_container = ft.Container(
-            content=self.alert_banner,
-            padding=ft.padding.symmetric(horizontal=20, vertical=5),
-        )
-
-        # ── Filas responsivas (wrap=True para móvil) ─────────────────────
-        #    expand= y width= simultáneos colapsan en Flet web → solo width.
-        #    Los anchos proporcionales se logran con expand sin width fijo.
-        # expand=N dentro de Row con wrap=True no funciona en Flet web;
-        # se usan contenedores con width relativo al viewport.
-        # En desktop se ven lado a lado; en móvil (wrap=True) se apilan.
-        top_row = ft.Row(
-            controls=[
-                ft.Container(
-                    content=self.current_weather_container,
-                    width=360,
-                ),
-                ft.Container(
-                    content=self.trend_container,
-                    width=780,
-                ),
-            ],
-            spacing=15,
-            alignment=ft.MainAxisAlignment.START,
-            wrap=True,
-            vertical_alignment=ft.CrossAxisAlignment.START,
-        )
-
-        middle_row = ft.Row(
-            controls=[
-                ft.Container(
-                    content=self.wind_vis_container,
-                    width=240,
-                ),
-                ft.Container(
-                    content=self.forecast_container,
-                    width=900,
-                ),
-            ],
-            spacing=15,
-            alignment=ft.MainAxisAlignment.START,
-            wrap=True,
-            vertical_alignment=ft.CrossAxisAlignment.START,
-        )
-
-        alerts_section = ft.Container(
-            content=ft.Column(
-                controls=[
-                    ft.Text(self.txt["label_alerts"], size=11, color=C["accent2"], weight=ft.FontWeight.BOLD),
-                    self.alerts_container,
-                ],
-                spacing=8,
-            ),
-            padding=ft.padding.symmetric(horizontal=20, vertical=10),
-        )
-
-        # ── Bloque de ubicación ──────────────────────────────────────
-        location_block = ft.Container(
-            content=ft.Column(
-                controls=[
-                    ft.Text(self.txt["label_location"], size=11, color=C["label"]),
-                    self.city_display,
-                ],
-                spacing=5,
-            ),
-            padding=ft.padding.only(left=20, top=20),
-        )
-
-        footer = ft.Container(
-            content=ft.Column(
-                controls=[
-                    ft.Divider(color=C["border"]),
-                    ft.Text(self.txt["footer_ref"],      size=9, color=C["muted"]),
-                    ft.Text(self.txt["footer_features"], size=8, color=C["muted"]),
-                ],
-                spacing=5,
-                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-            ),
-            padding=ft.padding.all(10),
-        )
-
-        tip = ft.Container(
-            content=ft.Text(self.txt["tip_click"], size=9, color=C["muted"], italic=True),
-            padding=10,
-        )
-
-        # page.scroll = AUTO → page.add() actúa como una lista vertical simple.
-        # Cada control se apila sin necesidad de expand ni Column intermedio.
-        self.page.add(
-            header,
-            button_bar,
-            alert_banner_container,
-            location_block,
-            ft.Container(content=top_row,    padding=ft.padding.symmetric(horizontal=20)),
-            ft.Container(content=middle_row, padding=ft.padding.symmetric(horizontal=20)),
-            alerts_section,
-            tip,
-            footer,
-        )
-
-    def _rebuild_ui(self):
-        self.page.controls.clear()
-        self._build_ui()
-        self.page.update()
-
-    def _create_button(self, text: str, on_click, bg: str, fg: str, border_color: str = None):
-        return ft.ElevatedButton(
-            text=text,
-            on_click=on_click,
-            style=ft.ButtonStyle(
-                bgcolor=bg, color=fg,
-                overlay_color=C["border"],
-                shape=ft.RoundedRectangleBorder(radius=5),
-                side=ft.BorderSide(1, border_color) if border_color else None,
-            ),
-        )
-
-    # ──────────────────────────────────────────────────────────────────────
-    # GEOLOCALIZACIÓN Y CLIMA
-    # ──────────────────────────────────────────────────────────────────────
-
-    def detect_location(self):
+    async def _request_browser_location(self):
+        """Pide permiso al navegador, obtiene lat/lon y actualiza el clima."""
         self.status_text.value = self.txt["status_detecting"]
         self.status_text.color = C["warn"]
+        self.city_display.value = "Solicitando permisos de ubicación..."
         self.page.update()
-        threading.Thread(target=self._detect_location_thread, daemon=True).start()
 
-    def _detect_location_thread(self):
+        try:
+            # Obtener posición geográfica desde el navegador
+            pos = await self.geolocator.get_current_position()
+            lat = pos.latitude
+            lon = pos.longitude
+            print(f"📍 Ubicación obtenida: {lat}, {lon}")
+
+            # Usar coordenadas para obtener el clima
+            self.get_weather_by_coords(lat, lon)
+        except Exception as e:
+            # Fallback a geolocalización por IP si el usuario deniega o hay error
+            print(f"⚠️ Error en geolocalización nativa: {e}. Usando fallback por IP.")
+            self.status_text.value = self.txt["status_error_location"]
+            self.status_text.color = C["warn"]
+            self.city_display.value = "Usando ubicación aproximada (IP)..."
+            self.page.update()
+            # Llamar al método tradicional por IP (IP-API)
+            threading.Thread(target=self._detect_location_by_ip, daemon=True).start()
+
+    def get_weather_by_coords(self, lat: float, lon: float):
+        """Pide el clima usando latitud y longitud directamente a OpenWeatherMap."""
+        self.status_text.value = self.txt["status_loading"]
+        self.status_text.color = C["warn"]
+        self.page.update()
+        threading.Thread(target=self._fetch_weather_by_coords, args=(lat, lon), daemon=True).start()
+
+    def _fetch_weather_by_coords(self, lat: float, lon: float):
+        try:
+            params = {"lat": lat, "lon": lon, "appid": API_KEY, "units": "metric", "lang": "es"}
+
+            r = requests.get(f"{BASE_URL}/weather", params=params, timeout=10)
+            if r.status_code == 401:
+                self.status_text.value = self.txt["status_error_apikey"]
+                self.status_text.color = C["red"]
+                self.page.update()
+                self._show_api_key_message()
+                return
+            r.raise_for_status()
+            weather_data = r.json()
+            # Extraer nombre de ciudad del JSON
+            city_name = weather_data.get("name", f"Coordenadas {lat}, {lon}")
+            self.current_city = city_name
+            self.city_name = city_name
+            self.city_display.value = city_name
+            self.current_weather = weather_data
+
+            # Pronóstico con mismas coordenadas
+            rf = requests.get(f"{BASE_URL}/forecast", params=params, timeout=10)
+            rf.raise_for_status()
+            self.forecast_data = rf.json()
+
+            # Datos horarios próximas 24 h
+            self.hourly_forecast = []
+            for item in self.forecast_data.get("list", [])[:8]:
+                dt = datetime.datetime.fromtimestamp(item["dt"])
+                rain = 0
+                if "rain" in item:
+                    rain = item["rain"].get("3h", item["rain"].get("1h", 0) * 3)
+                self.hourly_forecast.append({
+                    "hour": dt.strftime("%H:00"),
+                    "temp": item["main"]["temp"],
+                    "weather_id": item["weather"][0]["id"],
+                    "pop": item.get("pop", 0),
+                    "rain": rain,
+                })
+
+            self._process_hourly_data_by_day()
+            self._calculate_daily_summary()
+            self._analyze_alerts()
+
+            if self.daily_forecasts_data:
+                first_day = list(self.daily_forecasts_data.keys())[0]
+                self.selected_day = first_day
+                self._update_trend_display_for_day(first_day)
+
+            self._check_alerts()
+            self._update_current_weather()
+            self._update_forecast()
+            self._update_wind_visibility()
+            self._update_alerts_display()
+
+            self.status_text.value = self.txt["status_updated"]
+            self.status_text.color = C["green"]
+            self.page.update()
+
+        except requests.exceptions.RequestException as exc:
+            msg = str(exc)
+            if "401" in msg:
+                self.status_text.value = "● Error: API Key inválida"
+            elif "404" in msg:
+                self.status_text.value = "● Error: No se encontró la ubicación"
+            else:
+                self.status_text.value = f"● Error: {msg[:40]}"
+            self.status_text.color = C["red"]
+            self.page.update()
+        except Exception as exc:
+            self.status_text.value = f"● Error: {str(exc)[:40]}"
+            self.status_text.color = C["red"]
+            self.page.update()
+
+    # ──────────────────────────────────────────────────────────────────────
+    # FALLBACK: detección por IP (cuando no hay geolocalización nativa)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _detect_location_by_ip(self):
+        """Método original basado en IP-API, usado como respaldo."""
         try:
             response = requests.get(IP_API_URL, timeout=10)
             data     = response.json()
@@ -630,7 +533,7 @@ class WeatherPro:
             self.page.update()
 
     def get_weather_by_city(self, city: str):
-        """Lanza la petición HTTP en un thread daemon para no bloquear la UI."""
+        """Lanza la petición HTTP por nombre de ciudad (para el fallback)."""
         self.status_text.value = self.txt["status_loading"]
         self.status_text.color = C["warn"]
         self.page.update()
@@ -655,6 +558,8 @@ class WeatherPro:
             r.raise_for_status()
             self.current_weather = r.json()
             self.current_city    = city
+            self.city_name       = f"{city}"
+            self.city_display.value = self.city_name
 
             rf = requests.get(f"{BASE_URL}/forecast", params=params, timeout=10)
             rf.raise_for_status()
@@ -710,7 +615,182 @@ class WeatherPro:
             self.page.update()
 
     # ──────────────────────────────────────────────────────────────────────
-    # PROCESAMIENTO DE DATOS
+    # PERSISTENCIA — page.client_storage
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def _load_config(self):
+        """Lee preferencias desde el localStorage del navegador."""
+        try:
+            celsius  = await self.page.client_storage.get_async("jh_weather.use_celsius")
+            language = await self.page.client_storage.get_async("jh_weather.language")
+            if celsius  is not None: self.use_celsius = bool(celsius)
+            if language is not None: self.language    = str(language)
+        except Exception:
+            pass  # Primera visita o storage no disponible
+
+    async def _save_config(self):
+        """Persiste preferencias en el localStorage del navegador."""
+        try:
+            await self.page.client_storage.set_async("jh_weather.use_celsius", self.use_celsius)
+            await self.page.client_storage.set_async("jh_weather.language",    self.language)
+        except Exception:
+            pass
+
+    # ──────────────────────────────────────────────────────────────────────
+    # RELOJ EN TIEMPO REAL — asyncio
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def _clock_loop(self):
+        """Actualiza el reloj cada segundo sin bloquear el hilo principal."""
+        while self._clock_running:
+            self.clock_text.value = datetime.datetime.now().strftime("%d/%m/%Y  %H:%M:%S")
+            self.page.update()
+            await asyncio.sleep(1)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # CONSTRUCCIÓN DE UI (idéntica a la original)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        self.txt = TEXTS[self.language]
+
+        # ── Header ──────────────────────────────────────────────────────
+        header = ft.Container(
+            content=ft.Row(
+                controls=[
+                    ft.Text(self.txt["title"], size=20, weight=ft.FontWeight.BOLD, color=C["accent"]),
+                    ft.Container(
+                        content=ft.Row(
+                            controls=[ft.Text("🔧", size=14, color=C["green"]), self.status_text],
+                            spacing=5,
+                        )
+                    ),
+                    ft.Row(
+                        controls=[
+                            ft.Text(self.txt["unit_celsius"], size=11, color=C["label"]),
+                            self.unit_switch,
+                            ft.Text(self.txt["lang_es"], size=10,
+                                    color=C["accent"] if self.language == "es" else C["muted"]),
+                            self.lang_switch,
+                            ft.Text(self.txt["lang_en"], size=10,
+                                    color=C["accent2"] if self.language == "en" else C["muted"]),
+                            self.clock_text,
+                        ],
+                        alignment=ft.MainAxisAlignment.END, spacing=5, wrap=True,
+                    ),
+                ],
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN, wrap=True,
+            ),
+            bgcolor="#070a0d",
+            padding=ft.padding.symmetric(horizontal=20, vertical=10),
+        )
+
+        # ── Barra de botones ─────────────────────────────────────────────
+        button_bar = ft.Container(
+            content=ft.Row(
+                controls=[
+                    self._create_button(self.txt["btn_refresh"], self.refresh_data, C["accent"], C["button_text"]),
+                    self._create_button(self.txt["btn_share"],   self.share_weather, C["warn"],  C["button_text"]),
+                ],
+                spacing=10, wrap=True,
+            ),
+            padding=ft.padding.symmetric(horizontal=20, vertical=8),
+        )
+
+        alert_banner_container = ft.Container(
+            content=self.alert_banner,
+            padding=ft.padding.symmetric(horizontal=20, vertical=5),
+        )
+
+        # ── Filas responsivas ─────────────────────────────────────────────
+        top_row = ft.Row(
+            controls=[
+                ft.Container(content=self.current_weather_container, width=360),
+                ft.Container(content=self.trend_container, width=780),
+            ],
+            spacing=15, alignment=ft.MainAxisAlignment.START, wrap=True,
+            vertical_alignment=ft.CrossAxisAlignment.START,
+        )
+
+        middle_row = ft.Row(
+            controls=[
+                ft.Container(content=self.wind_vis_container, width=240),
+                ft.Container(content=self.forecast_container, width=900),
+            ],
+            spacing=15, alignment=ft.MainAxisAlignment.START, wrap=True,
+            vertical_alignment=ft.CrossAxisAlignment.START,
+        )
+
+        alerts_section = ft.Container(
+            content=ft.Column(
+                controls=[
+                    ft.Text(self.txt["label_alerts"], size=11, color=C["accent2"], weight=ft.FontWeight.BOLD),
+                    self.alerts_container,
+                ],
+                spacing=8,
+            ),
+            padding=ft.padding.symmetric(horizontal=20, vertical=10),
+        )
+
+        location_block = ft.Container(
+            content=ft.Column(
+                controls=[
+                    ft.Text(self.txt["label_location"], size=11, color=C["label"]),
+                    self.city_display,
+                ],
+                spacing=5,
+            ),
+            padding=ft.padding.only(left=20, top=20),
+        )
+
+        footer = ft.Container(
+            content=ft.Column(
+                controls=[
+                    ft.Divider(color=C["border"]),
+                    ft.Text(self.txt["footer_ref"],      size=9, color=C["muted"]),
+                    ft.Text(self.txt["footer_features"], size=8, color=C["muted"]),
+                ],
+                spacing=5, horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            padding=ft.padding.all(10),
+        )
+
+        tip = ft.Container(
+            content=ft.Text(self.txt["tip_click"], size=9, color=C["muted"], italic=True),
+            padding=10,
+        )
+
+        self.page.add(
+            header,
+            button_bar,
+            alert_banner_container,
+            location_block,
+            ft.Container(content=top_row,    padding=ft.padding.symmetric(horizontal=20)),
+            ft.Container(content=middle_row, padding=ft.padding.symmetric(horizontal=20)),
+            alerts_section,
+            tip,
+            footer,
+        )
+
+    def _rebuild_ui(self):
+        self.page.controls.clear()
+        self._build_ui()
+        self.page.update()
+
+    def _create_button(self, text: str, on_click, bg: str, fg: str, border_color: str = None):
+        return ft.ElevatedButton(
+            text=text,
+            on_click=on_click,
+            style=ft.ButtonStyle(
+                bgcolor=bg, color=fg,
+                overlay_color=C["border"],
+                shape=ft.RoundedRectangleBorder(radius=5),
+                side=ft.BorderSide(1, border_color) if border_color else None,
+            ),
+        )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # PROCESAMIENTO DE DATOS (idéntico al original)
     # ──────────────────────────────────────────────────────────────────────
 
     def _process_hourly_data_by_day(self):
@@ -829,7 +909,7 @@ class WeatherPro:
             }
 
     # ──────────────────────────────────────────────────────────────────────
-    # ALERTAS
+    # ALERTAS (idéntico)
     # ──────────────────────────────────────────────────────────────────────
 
     def _analyze_alerts(self):
@@ -972,7 +1052,7 @@ class WeatherPro:
         self.page.update()
 
     # ──────────────────────────────────────────────────────────────────────
-    # ACTUALIZACIÓN DE WIDGETS
+    # ACTUALIZACIÓN DE WIDGETS (idéntico)
     # ──────────────────────────────────────────────────────────────────────
 
     def _update_current_weather(self):
@@ -1099,7 +1179,6 @@ class WeatherPro:
             )
             forecast_cards.append(card)
 
-        # Re-asignar la Row (puede haber sido Column en init)
         self.forecast_container.content = ft.Row(
             controls=forecast_cards,
             spacing=15, wrap=True, alignment=ft.MainAxisAlignment.CENTER,
@@ -1246,7 +1325,7 @@ class WeatherPro:
         self.page.update()
 
     # ──────────────────────────────────────────────────────────────────────
-    # ACCIONES DE USUARIO
+    # ACCIONES DE USUARIO (idéntico)
     # ──────────────────────────────────────────────────────────────────────
 
     def toggle_units(self, e):
@@ -1306,18 +1385,16 @@ class WeatherPro:
         self.status_text.value = self.txt["status_showing"].format(num_hours, day_name)
         self.status_text.color = C["accent"]
         self.page.update()
-        # Reemplaza threading.Timer con una corrutina async
         self.page.run_task(self._reset_status_after_delay)
 
     async def _reset_status_after_delay(self, delay: float = 2.5):
-        """Reemplaza threading.Timer(2.5, ...) — sin bloquear el navegador."""
         await asyncio.sleep(delay)
         self.status_text.value = self.txt["status_updated"]
         self.status_text.color = C["green"]
         self.page.update()
 
     # ──────────────────────────────────────────────────────────────────────
-    # DIÁLOGOS
+    # DIÁLOGOS (idéntico)
     # ──────────────────────────────────────────────────────────────────────
 
     def _show_share_confirmation(self):
@@ -1372,9 +1449,6 @@ def main(page: ft.Page):
 
 
 if __name__ == "__main__":
-    # ── Modo WEB ──────────────────────────────────────────────────────────
-    # Para local:    flet run --web main.py
-    # Para producción (Netlify / Vercel): ver guía en README
     ft.app(
         target=main,
         view=ft.AppView.WEB_BROWSER,
