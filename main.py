@@ -1154,7 +1154,7 @@ class WeatherPro:
                             ft.Text(alert.title, size=14, weight=ft.FontWeight.BOLD, color=tx_c),
                             ft.Text("📢" if alert.is_official else "⚠️", size=12, color=tx_c),
                         ], spacing=5),
-                        ft.Text(alert.description, size=11, color=tx_c, wrap=True),
+                        ft.Text(alert.description, size=11, color=tx_c),
                     ], spacing=4, expand=True),
                 ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.START),
             ]
@@ -1164,7 +1164,7 @@ class WeatherPro:
                 details_text = "\n".join(f"• {d}" for d in alert.details if d)
                 if details_text:
                     alert_controls.append(
-                        ft.Text(details_text, size=10, color=tx_c, wrap=True)
+                        ft.Text(details_text, size=10, color=tx_c)
                     )
 
             # Añadir fuente si es alerta oficial
@@ -1598,3 +1598,4 @@ if __name__ == "__main__":
         view=ft.AppView.WEB_BROWSER,
         port=port,
     )
+    
