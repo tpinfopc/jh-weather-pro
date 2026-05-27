@@ -9,6 +9,8 @@ Cambios aplicados v3:
   3. Método heurístico de respaldo mejorado (detección precisa de lluvia extrema)
   4. Cálculo correcto de precipitación acumulada en 24h
   5. Alertas por niveles con información oficial de OWM
+  6. Corrección visibilidad: lógica heurística basada en weather_id para
+     estimar visibilidad real cuando OWM devuelve el tope genérico de 10.000m
 """
 
 import asyncio
@@ -1324,6 +1326,51 @@ class WeatherPro:
         )
         self.page.update()
 
+    def _get_real_visibility(self) -> str:
+        """
+        Calcula la visibilidad real de forma inteligente.
+        OWM devuelve 'visibility' en metros con tope de 10.000 m (10 km)
+        cuando no tiene datos precisos. Se complementa con el weather_id
+        actual para estimar visibilidad real segun condicion meteorologica.
+        """
+        raw_vis = self.current_weather.get("visibility", None)
+        wid = self.current_weather.get("weather", [{}])[0].get("id", 800)
+
+        # Estimar visibilidad segun condicion meteorologica
+        estimated = {
+            range(200, 233): 2.0,   # Tormenta electrica
+            range(300, 322): 4.0,   # Llovizna
+            range(500, 502): 6.0,   # Lluvia ligera
+            range(502, 532): 3.0,   # Lluvia moderada/intensa
+            range(600, 613): 3.0,   # Nieve ligera
+            range(613, 623): 1.0,   # Nieve intensa
+            range(700, 782): 0.5,   # Niebla, bruma, polvo, arena
+            range(800, 801): None,  # Cielo despejado -> usar dato real
+            range(801, 805): None,  # Nubes -> usar dato real
+        }
+
+        vis_km = None
+        if raw_vis is not None:
+            vis_km = raw_vis / 1000.0
+
+        # Si OWM devuelve el tope generico (10.000 m), verificar si
+        # la condicion climatica sugiere una visibilidad diferente
+        if vis_km is not None and raw_vis == 10000:
+            for rng, est in estimated.items():
+                if wid in rng and est is not None:
+                    vis_km = est
+                    break
+
+        if vis_km is None:
+            return "N/D"
+
+        if vis_km >= 10.0:
+            return ">=10 km"
+        elif vis_km >= 1.0:
+            return f"{vis_km:.1f} km"
+        else:
+            return f"{int(vis_km * 1000)} m"
+
     def _update_wind_visibility(self):
         if not self.current_weather:
             self.wind_vis_container.content = ft.Column(
@@ -1335,10 +1382,10 @@ class WeatherPro:
         wind = self.current_weather.get("wind", {})
         wsp = wind.get("speed", 0)
         wdeg = wind.get("deg", 0)
-        vis = self.current_weather.get("visibility", 0) / 1000
         dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
         wdir = dirs[int((wdeg + 22.5) // 45) % 8] if wdeg else "N/A"
         wkmh = wsp * 3.6
+        vis_str = self._get_real_visibility()
 
         self.wind_vis_container.content = ft.Column(
             controls=[
@@ -1349,7 +1396,7 @@ class WeatherPro:
                     ft.Text(f"{self.txt['label_direction']}: {wdir}", size=11, color=C["label"]),
                 ], spacing=2)], spacing=10),
                 ft.Row(controls=[ft.Text("👁️", size=24), ft.Column(controls=[
-                    ft.Text(f"{vis:.1f} km", size=16, weight=ft.FontWeight.BOLD, color=C["text"]),
+                    ft.Text(vis_str, size=16, weight=ft.FontWeight.BOLD, color=C["text"]),
                     ft.Text(self.txt["label_visibility"], size=11, color=C["label"]),
                 ], spacing=2)], spacing=10),
             ],
